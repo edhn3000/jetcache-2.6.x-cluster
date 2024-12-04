@@ -1,7 +1,9 @@
 package com.alicp.jetcache.redis;
 
 import com.alicp.jetcache.external.ExternalCacheConfig;
+
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.util.Pool;
 
 /**
@@ -15,6 +17,7 @@ public class RedisCacheConfig<K, V> extends ExternalCacheConfig<K, V> {
     private Pool<Jedis>[] jedisSlavePools;
     private boolean readFromSlave;
     private int[] slaveReadWeights;
+    private JedisCluster jedisCluster;
 
     public Pool<Jedis> getJedisPool() {
         return jedisPool;
@@ -46,5 +49,19 @@ public class RedisCacheConfig<K, V> extends ExternalCacheConfig<K, V> {
 
     public void setSlaveReadWeights(int... slaveReadWeights) {
         this.slaveReadWeights = slaveReadWeights;
+    }
+
+    /**
+     * @return the jedisCluster
+     */
+    public JedisCluster getJedisCluster() {
+        return jedisCluster;
+    }
+
+    /**
+     * @param jedisCluster the jedisCluster to set
+     */
+    public void setJedisCluster(JedisCluster jedisCluster) {
+        this.jedisCluster = jedisCluster;
     }
 }

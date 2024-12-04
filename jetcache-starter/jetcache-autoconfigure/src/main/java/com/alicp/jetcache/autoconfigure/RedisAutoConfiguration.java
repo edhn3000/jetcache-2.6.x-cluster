@@ -12,7 +12,10 @@ import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.util.ClassUtils;
+
+import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisSentinelPool;
 import redis.clients.jedis.Protocol;
@@ -20,10 +23,14 @@ import redis.clients.jedis.util.Pool;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Created on 2016/11/25.
@@ -57,44 +64,60 @@ public class RedisAutoConfiguration {
 
         @Override
         protected CacheBuilder initCache(ConfigTree ct, String cacheAreaWithPrefix) {
-            Pool jedisPool = parsePool(ct);
-            Pool[] slavesPool = null;
-            int[] slavesPoolWeights = null;
+            Object jedisObj = parsePool(ct);
             boolean readFromSlave = Boolean.parseBoolean(ct.getProperty("readFromSlave", "False"));
+            RedisCacheBuilder.RedisCacheBuilderImpl builder = RedisCacheBuilder.createRedisCacheBuilder()
+                    .readFromSlave(readFromSlave);
+            if (jedisObj instanceof Pool) {
+                builder.jedisPool((Pool<Jedis>) jedisObj);
+            } else if (jedisObj instanceof JedisCluster){
+                builder.JedisCluster((JedisCluster) jedisObj);
+            } else {
+                throw new CacheConfigException("unknown jedis pool config");
+            }
+
+            List<Object> slavesPool = null;
+            int[] slavesPoolWeights = null;
             ConfigTree slaves = ct.subTree("slaves.");
             Set<String> slaveNames = slaves.directChildrenKeys();
             if (slaveNames.size() > 0) {
-                slavesPool = new Pool[slaveNames.size()];
+                slavesPool = new ArrayList<>();
                 slavesPoolWeights = new int[slaveNames.size()];
                 int i = 0;
                 for (String slaveName: slaveNames) {
                     ConfigTree slaveConfig = slaves.subTree(slaveName + ".");
-                    slavesPool[i] = parsePool(slaveConfig);
+                    slavesPool.add(parsePool(slaveConfig));
                     slavesPoolWeights[i] = Integer.parseInt(slaveConfig.getProperty("weight","100"));
                     i++;
                 }
+                builder.slaveReadWeights(slavesPoolWeights);
+                if (slavesPool.get(0) instanceof Pool) {
+                    builder.jedisSlavePools(slavesPool.toArray(new Pool[0]));
+                } else if (slavesPool.get(0) instanceof JedisCluster){
+                    builder.JedisCluster((JedisCluster) slavesPool.get(0));
+                } else {
+                    throw new CacheConfigException("unknown jedis slave pool config");
+                }
             }
 
-            ExternalCacheBuilder externalCacheBuilder = RedisCacheBuilder.createRedisCacheBuilder()
-                    .jedisPool(jedisPool)
-                    .readFromSlave(readFromSlave)
-                    .jedisSlavePools(slavesPool)
-                    .slaveReadWeights(slavesPoolWeights);
 
-            parseGeneralConfig(externalCacheBuilder, ct);
+            parseGeneralConfig(builder, ct);
 
             // eg: "jedisPool.remote.default"
-            autoConfigureBeans.getCustomContainer().put("jedisPool." + cacheAreaWithPrefix, jedisPool);
+            autoConfigureBeans.getCustomContainer().put("jedisPool." + cacheAreaWithPrefix, jedisObj);
 
-            return externalCacheBuilder;
+            return builder;
         }
 
-        private Pool<Jedis> parsePool(ConfigTree ct) {
+        private Object parsePool(ConfigTree ct) {
             GenericObjectPoolConfig poolConfig = parsePoolConfig(ct);
 
+            Map<String, Object> cluster = ct.subTree("cluster"/*there is no dot*/).getProperties();
             String host = ct.getProperty("host", (String) null);
             int port = Integer.parseInt(ct.getProperty("port", "0"));
             int timeout = Integer.parseInt(ct.getProperty("timeout", String.valueOf(Protocol.DEFAULT_TIMEOUT)));
+            int connectionTimeout = Integer.parseInt(ct.getProperty("connectionTimeout", String.valueOf(timeout)));
+            int soTimeout = Integer.parseInt(ct.getProperty("soTimeout", String.valueOf(timeout)));
             String password = ct.getProperty("password", (String) null);
             int database = Integer.parseInt(ct.getProperty("database", String.valueOf(Protocol.DEFAULT_DATABASE)));
             String clientName = ct.getProperty("clientName", (String) null);
@@ -105,11 +128,30 @@ public class RedisAutoConfiguration {
 
             Pool<Jedis> jedisPool;
             if (sentinels == null) {
-                Objects.requireNonNull(host, "host/port or sentinels/masterName is required");
-                if (port == 0) {
-                    throw new IllegalStateException("host/port or sentinels/masterName is required");
+                if (cluster == null || cluster.size() == 0) {
+                    Objects.requireNonNull(host, "host/port or sentinels/masterName is required");
+                    if (port == 0) {
+                        throw new IllegalStateException("host/port or sentinels/masterName is required");
+                    }
+                    jedisPool = new JedisPool(poolConfig, host, port, timeout, password, database, clientName, ssl);
+                } else {
+                    int maxAttempt = Integer.parseInt(ct.getProperty("maxAttempt", "5"));
+                    Set<HostAndPort> hostAndPortSet = new HashSet<>();
+                    cluster.values().stream().map(String::valueOf).forEach(uri->{
+                        if (uri.contains(",")) { // 支持配置文件list一行写法
+                            hostAndPortSet.addAll(Arrays.stream(uri.split(",")).map(String::trim)
+                                    .map(i -> i.toString().split(":"))
+                                    .map(hostAndPort -> new HostAndPort(hostAndPort[0], Integer.parseInt(hostAndPort[1])))
+                                    .collect(Collectors.toSet()));
+                        } else { // 多行写法
+                            String[] hostAndPort = uri.split(":");
+                            hostAndPortSet.add(new HostAndPort(hostAndPort[0], Integer.parseInt(hostAndPort[1])));
+                        }
+                    });
+                    return new JedisCluster(hostAndPortSet, connectionTimeout, soTimeout, maxAttempt, password,
+                            clientName, poolConfig, ssl);
+
                 }
-                jedisPool = new JedisPool(poolConfig, host, port, timeout, password, database, clientName, ssl);
             } else {
                 Objects.requireNonNull(masterName, "host/port or sentinels/masterName is required");
                 String[] strings = sentinels.split(",");
